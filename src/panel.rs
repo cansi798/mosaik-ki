@@ -228,6 +228,9 @@ impl KiPanel {
             return;
         };
         self.state = match (job, result) {
+            (Job::Quick(_), Ok(Reply::Text(t))) if t.trim().is_empty() => {
+                State::Message(KiError::BadResponse("leere Antwort".into()).user_message())
+            }
             (Job::Quick(action), Ok(Reply::Text(t))) => State::Preview {
                 text: actions::postprocess(action.apply, &t),
                 apply: action.apply,
@@ -364,6 +367,27 @@ mod tests {
         }
         panel.accept_preview(&mut host);
         assert_eq!(host.applied, vec!["Korrigiert.".to_string()]);
+    }
+
+    #[test]
+    fn empty_quick_result_becomes_message() {
+        let mut panel = KiPanel::new(&TEXT_ACTIONS);
+        panel.ready = Some(true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(crate::client::Reply::Text("  ".into())))
+            .unwrap();
+        panel.state = State::Busy {
+            rx,
+            job: Job::Quick(&TEXT_ACTIONS[0]),
+        };
+        let mut host = Host::default();
+        panel.poll(&mut host);
+        match &panel.state {
+            State::Message(m) => {
+                assert_eq!(*m, KiError::BadResponse("x".into()).user_message());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

@@ -45,6 +45,13 @@ impl AgentRun {
     pub fn on_reply(&mut self, reply: Reply, tools: &mut dyn KiTools) -> Step {
         self.steps += 1;
         match reply {
+            Reply::Text(text) if text.trim().is_empty() => {
+                if self.steps > 1 {
+                    Step::Done("Erledigt.".into())
+                } else {
+                    Step::Failed(KiError::BadResponse("leere Antwort".into()))
+                }
+            }
             Reply::Text(text) => Step::Done(text),
             Reply::ToolCalls { calls, raw } => {
                 if self.steps >= MAX_STEPS {

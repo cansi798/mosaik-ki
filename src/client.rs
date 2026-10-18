@@ -139,8 +139,86 @@ pub fn parse_reply(body: &str) -> Result<Reply, KiError> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    if text.is_empty() {
-        return Err(KiError::BadResponse("leere Antwort".into()));
+    if let Some(calls) = parse_native_calls(text) {
+        let list: Vec<Value> = calls
+            .iter()
+            .map(|c| {
+                json!({"id": c.id, "type": "function",
+                    "function": {"name": c.name, "arguments": c.arguments.to_string()}})
+            })
+            .collect();
+        return Ok(Reply::ToolCalls {
+            calls,
+            raw: json!({"role": "assistant", "content": null, "tool_calls": list}),
+        });
     }
     Ok(Reply::Text(text.to_string()))
+}
+
+const QUOTE: &str = "<|\"|>";
+
+/// Gemma-natives Aufrufformat, falls der Server es nicht selbst zerlegt hat:
+/// `name{key:<|"|>wert<|"|>,zahl:3}`, ein- oder mehrfach. Nur wenn der ganze Text passt.
+fn parse_native_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let mut rest = text.trim();
+    let mut calls = Vec::new();
+    while !rest.is_empty() {
+        let name_len = rest
+            .char_indices()
+            .find(|&(i, c)| {
+                !(c == '_'
+                    || c.is_ascii_alphabetic()
+                    || (i > 0 && (c.is_ascii_digit() || c == '.')))
+            })
+            .map_or(rest.len(), |(i, _)| i);
+        if name_len == 0 {
+            return None;
+        }
+        let name = &rest[..name_len];
+        rest = rest[name_len..].strip_prefix('{')?;
+        let mut args = serde_json::Map::new();
+        if let Some(after) = rest.strip_prefix('}') {
+            rest = after;
+        } else {
+            loop {
+                let colon = rest.find(':')?;
+                let key = &rest[..colon];
+                if key.is_empty()
+                    || !key
+                        .chars()
+                        .all(|c| c == '_' || c == '.' || c.is_ascii_alphanumeric())
+                {
+                    return None;
+                }
+                rest = &rest[colon + 1..];
+                let value = if let Some(q) = rest.strip_prefix(QUOTE) {
+                    let end = q.find(QUOTE)?;
+                    rest = &q[end + QUOTE.len()..];
+                    Value::String(q[..end].to_string())
+                } else {
+                    let end = rest.find([',', '}'])?;
+                    let raw = rest[..end].trim();
+                    rest = &rest[end..];
+                    serde_json::from_str::<Value>(raw)
+                        .ok()
+                        .filter(|v| v.is_number() || v.is_boolean() || v.is_null())
+                        .unwrap_or_else(|| Value::String(raw.to_string()))
+                };
+                args.insert(key.to_string(), value);
+                if let Some(after) = rest.strip_prefix(',') {
+                    rest = after;
+                } else {
+                    rest = rest.strip_prefix('}')?;
+                    break;
+                }
+            }
+        }
+        calls.push(ToolCall {
+            id: format!("call_{}", calls.len()),
+            name: name.to_string(),
+            arguments: Value::Object(args),
+        });
+        rest = rest.trim_start();
+    }
+    if calls.is_empty() { None } else { Some(calls) }
 }

@@ -111,3 +111,26 @@ fn stops_after_max_steps() {
     assert!(matches!(e, KiError::ToolFailed(_)));
     assert!(tools.set.len() < agent::MAX_STEPS);
 }
+
+#[test]
+fn empty_text_after_tool_round_is_done() {
+    let mut chat = Scripted(
+        VecDeque::from([call(json!({"cell":"A1"})), Reply::Text(String::new())]),
+        vec![],
+    );
+    let mut tools = Cells::default();
+    assert_eq!(
+        agent::run_blocking(&mut chat, &mut tools, "s", "u").unwrap(),
+        "Erledigt."
+    );
+}
+
+#[test]
+fn empty_text_first_is_bad_response() {
+    let mut chat = Scripted(VecDeque::from([Reply::Text("  ".into())]), vec![]);
+    let mut tools = Cells::default();
+    assert!(matches!(
+        agent::run_blocking(&mut chat, &mut tools, "s", "u"),
+        Err(KiError::BadResponse(_))
+    ));
+}

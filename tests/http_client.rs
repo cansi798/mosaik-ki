@@ -86,12 +86,77 @@ fn parses_tool_calls_with_string_arguments() {
 }
 
 #[test]
-fn empty_or_garbage_is_bad_response() {
+fn empty_is_empty_text_and_garbage_is_bad_response() {
     assert!(matches!(parse_reply("nope"), Err(KiError::BadResponse(_))));
     let empty = r#"{"choices":[{"message":{"role":"assistant","content":"   "}}]}"#;
-    assert!(matches!(parse_reply(empty), Err(KiError::BadResponse(_))));
+    assert_eq!(parse_reply(empty).unwrap(), Reply::Text(String::new()));
 }
 
+fn content_reply(content: &str) -> String {
+    json!({"choices":[{"message":{"role":"assistant","content":content}}]}).to_string()
+}
+
+#[test]
+fn native_syntax_with_two_string_args_becomes_tool_call() {
+    let r = parse_reply(&content_reply(
+        r#"cell_set{cell:<|"|>A1<|"|>,input:<|"|>Umsatz<|"|>}"#,
+    ))
+    .unwrap();
+    let Reply::ToolCalls { calls, raw } = r else {
+        panic!("{r:?}")
+    };
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "call_0");
+    assert_eq!(calls[0].name, "cell_set");
+    assert_eq!(calls[0].arguments, json!({"cell":"A1","input":"Umsatz"}));
+    assert_eq!(raw["role"], "assistant");
+    assert!(raw["content"].is_null());
+    assert_eq!(raw["tool_calls"][0]["id"], "call_0");
+    assert_eq!(raw["tool_calls"][0]["type"], "function");
+    assert_eq!(raw["tool_calls"][0]["function"]["name"], "cell_set");
+    let args: serde_json::Value = serde_json::from_str(
+        raw["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(args, json!({"cell":"A1","input":"Umsatz"}));
+}
+
+#[test]
+fn native_syntax_numbers_bools_and_two_calls() {
+    let r = parse_reply(&content_reply(
+        r#"a.b{n:42,f:1.5,t:true,z:null,w:wort} cell_set{cell:<|"|>B2<|"|>}"#,
+    ))
+    .unwrap();
+    let Reply::ToolCalls { calls, .. } = r else {
+        panic!("{r:?}")
+    };
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].name, "a.b");
+    assert_eq!(
+        calls[0].arguments,
+        json!({"n":42,"f":1.5,"t":true,"z":null,"w":"wort"})
+    );
+    assert_eq!(calls[1].id, "call_1");
+    assert_eq!(calls[1].arguments, json!({"cell":"B2"}));
+}
+
+#[test]
+fn prose_with_braces_stays_text() {
+    for t in [
+        "Das Format ist {a:1} laut Handbuch.",
+        "Hier: f{x:1} und danach Text",
+        "{}",
+        "cell_set{cell:<|\"|>A1",
+    ] {
+        assert_eq!(
+            parse_reply(&content_reply(t)).unwrap(),
+            Reply::Text(t.to_string()),
+            "{t}"
+        );
+    }
+}
 fn raw_server(reply: &'static [u8]) -> u16 {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
