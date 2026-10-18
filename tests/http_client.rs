@@ -91,3 +91,55 @@ fn empty_or_garbage_is_bad_response() {
     let empty = r#"{"choices":[{"message":{"role":"assistant","content":"   "}}]}"#;
     assert!(matches!(parse_reply(empty), Err(KiError::BadResponse(_))));
 }
+
+fn raw_server(reply: &'static [u8]) -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            use std::io::Write;
+            let _ = s.write_all(reply);
+        }
+    });
+    port
+}
+
+#[test]
+fn complete_response_survives_reset_from_unread_request() {
+    let port = raw_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world",
+    );
+    let r = http::request(
+        port,
+        "POST",
+        "/",
+        Some(&"x".repeat(50_000)),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert_eq!((r.status, r.body.as_str()), (200, "hello world"));
+}
+
+#[test]
+fn truncated_body_is_malformed() {
+    let port = raw_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789",
+    );
+    let e = http::request(port, "GET", "/", None, Duration::from_secs(2)).unwrap_err();
+    assert!(matches!(e, HttpError::Malformed(_)), "{e:?}");
+}
+
+#[test]
+fn dropped_connection_without_reply_is_refused() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || drop(listener.accept()));
+    let r = http::request(
+        port,
+        "POST",
+        "/",
+        Some(&"x".repeat(50_000)),
+        Duration::from_secs(2),
+    );
+    assert_eq!(r, Err(HttpError::Refused));
+}

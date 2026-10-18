@@ -37,11 +37,16 @@ pub fn request(
     stream.write_all(body.as_bytes()).map_err(map_io)?;
     let mut raw = Vec::new();
     // Schließt die Gegenseite, ohne die Anfrage zu lesen, kommt ein Reset; bereits
-    // Empfangenes bleibt gültig.
+    // Empfangenes bleibt gültig. Ein abgeschnittener Rumpf wird in `parse_response`
+    // über Content-Length erkannt.
     if let Err(e) = stream.read_to_end(&mut raw)
         && (raw.is_empty() || e.kind() != std::io::ErrorKind::ConnectionReset)
     {
         return Err(map_io(e));
+    }
+    if raw.is_empty() {
+        // Verbindung ohne jede Antwort geschlossen: wie "niemand zuhause".
+        return Err(HttpError::Refused);
     }
     parse_response(&raw)
 }
@@ -49,9 +54,11 @@ pub fn request(
 fn map_io(e: std::io::Error) -> HttpError {
     use std::io::ErrorKind;
     match e.kind() {
-        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset | ErrorKind::NotConnected => {
-            HttpError::Refused
-        }
+        ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::NotConnected => HttpError::Refused,
         ErrorKind::TimedOut | ErrorKind::WouldBlock => HttpError::Timeout,
         _ => HttpError::Io(e.to_string()),
     }
@@ -73,13 +80,24 @@ pub fn parse_response(raw: &[u8]) -> Result<HttpResponse, HttpError> {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| malformed("Statuszeile"))?;
-    let chunked = lines.any(|l| {
+    let mut chunked = false;
+    let mut content_length: Option<usize> = None;
+    for l in lines {
         let l = l.to_ascii_lowercase();
-        l.starts_with("transfer-encoding:") && l.contains("chunked")
-    });
+        if l.starts_with("transfer-encoding:") && l.contains("chunked") {
+            chunked = true;
+        } else if let Some(v) = l.strip_prefix("content-length:") {
+            content_length = v.trim().parse().ok();
+        }
+    }
     let rest = &raw[split + 4..];
     let bytes = if chunked {
         decode_chunked(rest)?
+    } else if let Some(n) = content_length {
+        if rest.len() < n {
+            return Err(malformed("Antwort unvollständig"));
+        }
+        rest[..n].to_vec()
     } else {
         rest.to_vec()
     };
