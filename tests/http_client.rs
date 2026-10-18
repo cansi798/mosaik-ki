@@ -130,7 +130,7 @@ fn truncated_body_is_malformed() {
 }
 
 #[test]
-fn dropped_connection_without_reply_is_refused() {
+fn dropped_connection_without_reply_is_not_refused() {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || drop(listener.accept()));
@@ -141,5 +141,10 @@ fn dropped_connection_without_reply_is_refused() {
         Some(&"x".repeat(50_000)),
         Duration::from_secs(2),
     );
-    assert_eq!(r, Err(HttpError::Refused));
+    let e = r.unwrap_err();
+    assert_ne!(e, HttpError::Refused);
+    assert!(
+        matches!(e, HttpError::Io(_) | HttpError::Malformed(_)),
+        "{e:?}"
+    );
 }

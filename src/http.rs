@@ -25,7 +25,8 @@ pub fn request(
     timeout: Duration,
 ) -> Result<HttpResponse, HttpError> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(map_io)?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(map_connect)?;
     stream.set_read_timeout(Some(timeout)).map_err(map_io)?;
     stream.set_write_timeout(Some(timeout)).map_err(map_io)?;
     let body = body.unwrap_or("");
@@ -33,8 +34,10 @@ pub fn request(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(head.as_bytes()).map_err(map_io)?;
-    stream.write_all(body.as_bytes()).map_err(map_io)?;
+    // Schreibfehler (z. B. Gegenseite schon zu) zählen erst, wenn keine Antwort kam.
+    let write_result = stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(body.as_bytes()));
     let mut raw = Vec::new();
     // Schließt die Gegenseite, ohne die Anfrage zu lesen, kommt ein Reset; bereits
     // Empfangenes bleibt gültig. Ein abgeschnittener Rumpf wird in `parse_response`
@@ -45,20 +48,27 @@ pub fn request(
         return Err(map_io(e));
     }
     if raw.is_empty() {
-        // Verbindung ohne jede Antwort geschlossen: wie "niemand zuhause".
-        return Err(HttpError::Refused);
+        return Err(match write_result {
+            Err(e) => map_io(e),
+            Ok(()) => malformed("keine Antwort"),
+        });
     }
     parse_response(&raw)
 }
 
+/// `Refused` heißt ausschließlich: der Verbindungsaufbau selbst wurde abgelehnt.
+fn map_connect(e: std::io::Error) -> HttpError {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::ConnectionRefused => HttpError::Refused,
+        _ => map_io(e),
+    }
+}
+
+/// Fehler nach erfolgreichem Verbindungsaufbau sind nie `Refused`.
 fn map_io(e: std::io::Error) -> HttpError {
     use std::io::ErrorKind;
     match e.kind() {
-        ErrorKind::ConnectionRefused
-        | ErrorKind::ConnectionReset
-        | ErrorKind::ConnectionAborted
-        | ErrorKind::BrokenPipe
-        | ErrorKind::NotConnected => HttpError::Refused,
         ErrorKind::TimedOut | ErrorKind::WouldBlock => HttpError::Timeout,
         _ => HttpError::Io(e.to_string()),
     }

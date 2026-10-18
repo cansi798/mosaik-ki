@@ -12,6 +12,14 @@ use mosaik_ki::server::{self, Probe};
 use mosaik_ki::{KiConfig, KiError, Tier, http};
 use serde_json::json;
 
+/// Die Tests starten Prozesse und suchen freie Ports; parallel laufen sie sich in die Quere
+/// (Port-Wettlauf, "Text file busy" beim Kopieren des Fake-Servers). Daher nacheinander.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn fake_install(dir: &Path) -> KiConfig {
     let mut cfg = KiConfig::new(Tier::Kompakt, dir.join("Mosaik Ü").join("ki"));
     cfg.port = common::free_port();
@@ -37,6 +45,7 @@ fn quit(port: u16) {
 
 #[test]
 fn args_contain_idle_sleep_alias_and_localhost() {
+    let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let cfg = fake_install(dir.path());
     let args: Vec<String> = server::server_args(&cfg, 4321)
@@ -64,6 +73,7 @@ fn args_contain_idle_sleep_alias_and_localhost() {
 
 #[test]
 fn not_installed_without_files() {
+    let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = KiConfig::new(Tier::Kompakt, dir.path().to_path_buf());
     assert_eq!(
@@ -74,6 +84,7 @@ fn not_installed_without_files() {
 
 #[test]
 fn starts_server_then_reuses_it() {
+    let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = fake_install(dir.path());
     assert_eq!(server::probe(cfg.port), Probe::Free);
@@ -90,6 +101,7 @@ fn starts_server_then_reuses_it() {
 
 #[test]
 fn foreign_program_on_port_moves_to_free_port_and_saves_it() {
+    let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = fake_install(dir.path());
     let foreign = TcpListener::bind(("127.0.0.1", cfg.port)).unwrap();
@@ -112,6 +124,7 @@ fn foreign_program_on_port_moves_to_free_port_and_saves_it() {
 
 #[test]
 fn waits_while_loading_and_times_out_with_clear_error() {
+    let _guard = serial();
     let port = common::free_port();
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
     std::thread::spawn(move || {
@@ -129,4 +142,17 @@ fn waits_while_loading_and_times_out_with_clear_error() {
     cfg.port = port;
     let e = server::ensure_running(&mut cfg, None, Duration::from_millis(800)).unwrap_err();
     assert!(matches!(e, KiError::Unavailable(_)), "{e:?}");
+}
+
+#[test]
+fn peer_that_drops_connections_is_foreign_not_free() {
+    let _guard = serial();
+    let port = common::free_port();
+    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    std::thread::spawn(move || {
+        for s in listener.incoming().flatten() {
+            drop(s);
+        }
+    });
+    assert_eq!(server::probe(port), Probe::Foreign);
 }
