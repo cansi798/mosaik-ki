@@ -7,10 +7,14 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod http;
+#[cfg(feature = "install")]
+pub mod install;
 pub mod models;
 #[cfg(feature = "egui")]
 pub mod panel;
 pub mod server;
+#[cfg(all(feature = "egui", feature = "install"))]
+mod setup_view;
 pub mod tier;
 
 pub use config::{KiConfig, default_config_path, default_install_dir};

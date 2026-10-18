@@ -70,6 +70,59 @@ pub const SHEET_ACTIONS: [QuickAction; 2] = [
     },
 ];
 
+/// Aktionen, die zusätzlich eine Beschreibung des Nutzers brauchen (Feld „Eigene Anweisung“):
+/// „Formel aus Beschreibung“.
+pub fn needs_description(action: &QuickAction) -> bool {
+    action.apply == Apply::InsertFormula
+}
+
+/// Wie [`build_messages`], schickt bei [`needs_description`] aber `description` mit. Leere Beschreibung
+/// ergibt [`KiError::NoDescription`]; die Zelldaten dürfen dann leer sein.
+pub fn build_messages_with(
+    action: &QuickAction,
+    input: &str,
+    description: &str,
+) -> Result<Vec<Value>, KiError> {
+    if !needs_description(action) {
+        return build_messages(action, input);
+    }
+    let description = description.trim();
+    if description.is_empty() {
+        return Err(KiError::NoDescription);
+    }
+    let user = if input.trim().is_empty() {
+        format!(
+            "{}
+
+Beschreibung: {description}",
+            action.instruction
+        )
+    } else {
+        format!(
+            "{}
+
+Beschreibung: {description}
+
+Daten:
+<<<
+{input}
+>>>",
+            action.instruction
+        )
+    };
+    let chars = user.chars().count();
+    if chars > MAX_INPUT_CHARS {
+        return Err(KiError::TooLong {
+            chars,
+            max: MAX_INPUT_CHARS,
+        });
+    }
+    Ok(vec![
+        json!({"role": "system", "content": SYSTEM_PROMPT}),
+        json!({"role": "user", "content": user}),
+    ])
+}
+
 pub fn build_messages(action: &QuickAction, input: &str) -> Result<Vec<Value>, KiError> {
     if input.trim().is_empty() {
         return Err(KiError::NothingSelected);
@@ -153,6 +206,40 @@ pub fn max_tokens_for(input: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn formula_needs_description_other_actions_ignore_it() {
+        let formel = &SHEET_ACTIONS[0];
+        assert!(needs_description(formel));
+        assert!(!needs_description(&SHEET_ACTIONS[1]));
+        assert!(TEXT_ACTIONS.iter().all(|a| !needs_description(a)));
+        assert_eq!(
+            build_messages_with(formel, "A1: 5", " "),
+            Err(KiError::NoDescription)
+        );
+        let m = build_messages_with(formel, "", "Mittelwert von B2:B9").unwrap();
+        let user = m[1]["content"].as_str().unwrap();
+        assert!(user.starts_with(formel.instruction));
+        assert!(
+            user.ends_with("Beschreibung: Mittelwert von B2:B9"),
+            "{user}"
+        );
+        let m = build_messages_with(formel, "B2: 1", "Mittelwert").unwrap();
+        assert!(m[1]["content"].as_str().unwrap().contains(
+            "Daten:
+<<<
+B2: 1
+>>>"
+        ));
+        assert_eq!(
+            build_messages_with(&TEXT_ACTIONS[0], "Hallo", "egal"),
+            build_messages(&TEXT_ACTIONS[0], "Hallo")
+        );
+        assert!(matches!(
+            build_messages_with(formel, &"x".repeat(MAX_INPUT_CHARS), "Summe"),
+            Err(KiError::TooLong { .. })
+        ));
+    }
+
     use super::*;
 
     #[test]

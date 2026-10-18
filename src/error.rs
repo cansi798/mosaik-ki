@@ -5,9 +5,14 @@ use std::fmt;
 pub enum KiError {
     NotInstalled,
     NothingSelected,
+    /// „Formel aus Beschreibung“ ohne Beschreibung.
+    NoDescription,
     Unavailable(String),
     Timeout,
-    TooLong { chars: usize, max: usize },
+    TooLong {
+        chars: usize,
+        max: usize,
+    },
     ToolFailed(String),
     BadResponse(String),
     AnswerTooLong,
@@ -18,6 +23,7 @@ impl KiError {
         match self {
             Self::NotInstalled => ("KI ist nicht installiert \u{2013} mit \u{201e}KI-Stufe ändern \u{2026}\u{201c} nachrüsten.").into(),
             Self::NothingSelected => "Bitte zuerst Text markieren oder eine Anweisung eingeben.".into(),
+            Self::NoDescription => "Bitte beschreiben Sie, was die Formel berechnen soll.".into(),
             Self::Unavailable(_) => {
                 ("Die KI konnte nicht gestartet werden. Bitte die App neu starten oder \u{201e}KI-Stufe ändern \u{2026}\u{201c} erneut ausführen.").into()
             }
@@ -35,6 +41,7 @@ impl fmt::Display for KiError {
         match self {
             Self::NotInstalled => write!(f, "KI nicht installiert"),
             Self::NothingSelected => write!(f, "keine Eingabe"),
+            Self::NoDescription => write!(f, "keine Beschreibung"),
             Self::Unavailable(why) => write!(f, "KI-Dienst nicht verfügbar: {why}"),
             Self::Timeout => write!(f, "Zeitüberschreitung"),
             Self::TooLong { chars, max } => write!(f, "Eingabe zu lang: {chars} > {max} Zeichen"),
@@ -63,6 +70,7 @@ mod tests {
         let all = [
             KiError::NotInstalled,
             KiError::NothingSelected,
+            KiError::NoDescription,
             KiError::Unavailable("x".into()),
             KiError::Timeout,
             KiError::TooLong { chars: 2, max: 1 },

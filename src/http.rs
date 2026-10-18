@@ -17,6 +17,8 @@ pub enum HttpError {
     Malformed(String),
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub fn request(
     port: u16,
     method: &str,
@@ -25,8 +27,9 @@ pub fn request(
     timeout: Duration,
 ) -> Result<HttpResponse, HttpError> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream =
-        TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(map_connect)?;
+    // Windows meldet „abgelehnt“ auf 127.0.0.1 erst nach gut 2 s (SYN-Wiederholungen). Mit einer
+    // kürzeren Frist würde ein freier Port als Zeitüberschreitung gelten und der Dienst nie starten.
+    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(map_connect)?;
     stream.set_read_timeout(Some(timeout)).map_err(map_io)?;
     stream.set_write_timeout(Some(timeout)).map_err(map_io)?;
     let body = body.unwrap_or("");

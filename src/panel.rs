@@ -17,6 +17,8 @@ use crate::{KiConfig, KiError, default_config_path, server};
 ///    „Übernehmen“), macht die App das Dokument schreibgeschützt und ignoriert Änderungen und
 ///    Auswahlwechsel. Sonst würde die Antwort auf veralteten Inhalt angewendet.
 /// 2. Nach dem Schließen von „Mosaik einrichten“ (`open_setup`) ruft die App [`KiPanel::refresh`] auf.
+///    Mit dem Feature `install` installiert die Seitenleiste die KI selbst; `open_setup` wird dann
+///    nicht mehr aufgerufen.
 /// 3. `end_undo_group(false)` stellt exakt den Zustand wieder her, den `begin_undo_group` festgehalten hat.
 pub trait KiHost {
     /// Markierter Text bzw. Bereichsinhalt; ohne Markierung das ganze Dokument.
@@ -26,8 +28,9 @@ pub trait KiHost {
     fn begin_undo_group(&mut self);
     /// `keep == false`: den Zustand von `begin_undo_group` wiederherstellen (alle Schritte zurücknehmen).
     fn end_undo_group(&mut self, keep: bool);
-    /// Öffnet „Mosaik einrichten“ bei der Stufenwahl.
-    fn open_setup(&mut self);
+    /// Öffnet „Mosaik einrichten“ bei der Stufenwahl. Nur ohne Feature `install` nötig: mit ihm
+    /// zeigt die Seitenleiste die Stufenwahl selbst.
+    fn open_setup(&mut self) {}
 }
 
 /// Antwortlänge im Agentenbetrieb (kurze Werkzeugaufrufe und Abschlusstext).
@@ -41,6 +44,7 @@ enum Job {
 
 #[derive(Debug, Clone, Copy)]
 enum Click {
+    ChangeTier,
     Cancel,
     Accept,
     Dismiss,
@@ -65,6 +69,8 @@ pub struct KiPanel {
     instruction: String,
     state: State,
     ready: Option<bool>,
+    #[cfg(feature = "install")]
+    setup: Option<crate::setup_view::SetupView>,
 }
 
 impl KiPanel {
@@ -74,6 +80,64 @@ impl KiPanel {
             instruction: String::new(),
             state: State::Idle,
             ready: None,
+            #[cfg(feature = "install")]
+            setup: None,
+        }
+    }
+
+    /// Öffnet die Stufenwahl in der Seitenleiste (z. B. aus dem Hilfe-Menü „KI-Stufe ändern …“).
+    /// Während die KI arbeitet, passiert nichts.
+    #[cfg(feature = "install")]
+    pub fn open_tier_choice(&mut self) {
+        if matches!(self.state, State::Idle | State::Message(_)) && self.setup.is_none() {
+            self.state = State::Idle;
+            let closable = self.ready();
+            self.setup = Some(crate::setup_view::SetupView::open(closable));
+        }
+    }
+
+    /// `true`, solange die KI installiert oder entfernt wird.
+    #[cfg(feature = "install")]
+    pub fn is_installing(&self) -> bool {
+        self.setup.as_ref().is_some_and(|s| s.is_busy())
+    }
+
+    /// Knopf „KI-Stufe ändern …“: mit Feature `install` die eigene Stufenwahl, sonst „Mosaik einrichten“.
+    fn change_tier(&mut self, host: &mut dyn KiHost) {
+        #[cfg(feature = "install")]
+        {
+            let _ = host;
+            self.open_tier_choice();
+        }
+        #[cfg(not(feature = "install"))]
+        {
+            host.open_setup();
+            self.refresh();
+        }
+    }
+
+    /// Zeichnet die Stufenwahl, falls offen oder nötig. `true` = sonst nichts zeichnen.
+    #[cfg(feature = "install")]
+    fn show_setup(&mut self, ui: &mut egui::Ui) -> bool {
+        use crate::setup_view::{Outcome, SetupView};
+        if self.setup.is_none() && matches!(self.state, State::Idle) && !self.ready() {
+            self.setup = Some(SetupView::open(false));
+        }
+        let Some(view) = self.setup.as_mut() else {
+            return false;
+        };
+        match view.show(ui) {
+            Outcome::Open => true,
+            Outcome::Close => {
+                self.setup = None;
+                false
+            }
+            Outcome::Finished => {
+                self.setup = None;
+                self.refresh();
+                ui.ctx().request_repaint();
+                true
+            }
         }
     }
 
@@ -107,12 +171,15 @@ impl KiPanel {
     pub fn show(&mut self, ui: &mut egui::Ui, host: &mut dyn KiHost) {
         self.poll(host);
         ui.heading("KI");
+        #[cfg(feature = "install")]
+        if self.show_setup(ui) {
+            return;
+        }
         // Eine laufende Arbeit, Vorschau oder Meldung bleibt auch sichtbar, wenn `ready` umspringt.
         if !self.ready() && matches!(self.state, State::Idle) {
             ui.label(KiError::NotInstalled.user_message());
             if ui.button("KI-Stufe ändern …").clicked() {
-                host.open_setup();
-                self.refresh();
+                self.change_tier(host);
             }
             return;
         }
@@ -191,7 +258,14 @@ impl KiPanel {
                 }
             }
         }
+        if matches!(self.state, State::Idle) {
+            ui.add_space(8.0);
+            if ui.small_button("KI-Stufe ändern …").clicked() {
+                click = Some(Click::ChangeTier);
+            }
+        }
         match click {
+            Some(Click::ChangeTier) => self.change_tier(host),
             Some(Click::Cancel) => self.cancel(host),
             Some(Click::Accept) => self.accept_preview(host),
             Some(Click::Dismiss) => self.state = State::Idle,
@@ -199,8 +273,13 @@ impl KiPanel {
         }
     }
 
+    /// Bei „Formel aus Beschreibung“ dient das Feld „Eigene Anweisung“ als Beschreibung.
+    fn quick_messages(&self, action: &QuickAction, input: &str) -> Result<Vec<Value>, KiError> {
+        actions::build_messages_with(action, input, &self.instruction)
+    }
+
     fn start_quick(&mut self, action: &'static QuickAction, input: &str) {
-        match actions::build_messages(action, input) {
+        match self.quick_messages(action, input) {
             Ok(messages) => {
                 let rx = spawn_chat(messages, Vec::new(), actions::max_tokens_for(input));
                 self.state = State::Busy {
@@ -489,6 +568,33 @@ mod tests {
         }
         assert_eq!(host.begins, 0);
         assert!(host.groups.is_empty());
+    }
+
+    #[test]
+    fn formula_action_sends_instruction_as_description() {
+        let formel = &crate::actions::SHEET_ACTIONS[0];
+        let mut panel = KiPanel::new(&crate::actions::SHEET_ACTIONS);
+        panel.ready = Some(true);
+        panel.instruction = "  ".into();
+        panel.start_quick(formel, "A1: 5");
+        match &panel.state {
+            State::Message(m) => {
+                assert_eq!(m, "Bitte beschreiben Sie, was die Formel berechnen soll.")
+            }
+            other => panic!("{other:?}"),
+        }
+        panel.instruction = "Summe von A1 bis A3".into();
+        let messages = panel.quick_messages(formel, "A1: 5").unwrap();
+        let user = messages[1]["content"].as_str().unwrap();
+        assert!(user.contains("Beschreibung: Summe von A1 bis A3"), "{user}");
+        assert!(user.contains("A1: 5"), "{user}");
+        // Andere Aktionen ignorieren das Feld.
+        let erklaeren = &crate::actions::SHEET_ACTIONS[1];
+        let user = panel.quick_messages(erklaeren, "A1: 5").unwrap()[1]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!user.contains("Summe von A1"), "{user}");
     }
 
     #[test]
