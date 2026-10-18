@@ -26,17 +26,17 @@ pub const KOMPAKT_MODEL: ModelFile = ModelFile {
 };
 
 pub const PRO_MODEL: ModelFile = ModelFile {
-    repo: "google/gemma-4-12B-it-qat-q4_0-gguf",
-    file: "gemma-4-12b-it-qat-q4_0.gguf",
-    sha256: "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
-    size: 6_975_879_296,
+    repo: "google/gemma-4-E4B-it-qat-q4_0-gguf",
+    file: "gemma-4-E4B_q4_0-it.gguf",
+    sha256: "676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee",
+    size: 5_154_941_280,
 };
 
 pub const PRO_MMPROJ: ModelFile = ModelFile {
-    repo: "google/gemma-4-12B-it-qat-q4_0-gguf",
-    file: "mmproj-gemma-4-12b-it-qat-q4_0.gguf",
-    sha256: "cb018338a7538a9814d994bfe54644c71eb7ed54e31eae2f721e45fd3c260da7",
-    size: 175_115_616,
+    repo: "google/gemma-4-E4B-it-qat-q4_0-gguf",
+    file: "gemma-4-E4B-it-mmproj.gguf",
+    sha256: "7498a37cb619e55f2fcf87eb931f56e99389ed6d432e4c5c66110694c0d65578",
+    size: 991_552_256,
 };
 
 static KOMPAKT_FILES: [ModelFile; 1] = [KOMPAKT_MODEL];
@@ -127,6 +127,10 @@ mod tests {
         assert_eq!(
             KOMPAKT_MODEL.url(),
             "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf"
+        );
+        assert_eq!(
+            PRO_MODEL.url(),
+            "https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf"
         );
         let a = llama_asset("linux", "x86_64").unwrap();
         assert!(
