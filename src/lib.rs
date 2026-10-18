@@ -8,6 +8,8 @@ pub mod config;
 pub mod error;
 pub mod http;
 pub mod models;
+#[cfg(feature = "egui")]
+pub mod panel;
 pub mod server;
 pub mod tier;
 
