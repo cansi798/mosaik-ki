@@ -134,3 +134,19 @@ fn empty_text_first_is_bad_response() {
         Err(KiError::BadResponse(_))
     ));
 }
+
+#[test]
+fn empty_text_after_only_failed_tool_is_bad_response() {
+    let mut chat = Scripted(
+        VecDeque::from([call(json!({"cell":"ZZ"})), Reply::Text(String::new())]),
+        vec![],
+    );
+    let mut tools = Cells {
+        fail_times: 1,
+        ..Default::default()
+    };
+    assert!(matches!(
+        agent::run_blocking(&mut chat, &mut tools, "s", "u"),
+        Err(KiError::BadResponse(_))
+    ));
+}

@@ -24,6 +24,7 @@ pub struct AgentRun {
     messages: Vec<Value>,
     steps: usize,
     retried: bool,
+    tool_ok: bool,
 }
 
 impl AgentRun {
@@ -35,6 +36,7 @@ impl AgentRun {
             ],
             steps: 0,
             retried: false,
+            tool_ok: false,
         }
     }
 
@@ -46,7 +48,7 @@ impl AgentRun {
         self.steps += 1;
         match reply {
             Reply::Text(text) if text.trim().is_empty() => {
-                if self.steps > 1 {
+                if self.tool_ok {
                     Step::Done("Erledigt.".into())
                 } else {
                     Step::Failed(KiError::BadResponse("leere Antwort".into()))
@@ -60,7 +62,10 @@ impl AgentRun {
                 self.messages.push(raw);
                 for call in calls {
                     let content = match tools.call(&call.name, &call.arguments) {
-                        Ok(result) => result.to_string(),
+                        Ok(result) => {
+                            self.tool_ok = true;
+                            result.to_string()
+                        }
                         Err(err) if !self.retried => {
                             self.retried = true;
                             format!("Fehler: {err}. Bitte korrigiere den Aufruf.")

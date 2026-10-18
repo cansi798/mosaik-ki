@@ -8,7 +8,7 @@ Das Crate nutzt Threads und TCP und baut daher nicht für `wasm32`. Apps binden 
 
 ```toml
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-mosaik-ki = { git = "https://github.com/cansi798/mosaik-ki", tag = "v0.1.0", features = ["egui"] }
+mosaik-ki = { git = "https://github.com/cansi798/mosaik-ki", tag = "v0.1.1", features = ["egui"] }
 ```
 
 ## Dateilayout
