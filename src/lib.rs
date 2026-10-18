@@ -6,8 +6,9 @@ pub mod config;
 pub mod error;
 pub mod http;
 pub mod models;
+pub mod server;
 pub mod tier;
 
-pub use config::KiConfig;
+pub use config::{KiConfig, default_config_path, default_install_dir};
 pub use error::KiError;
 pub use tier::Tier;

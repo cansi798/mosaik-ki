@@ -36,7 +36,13 @@ pub fn request(
     stream.write_all(head.as_bytes()).map_err(map_io)?;
     stream.write_all(body.as_bytes()).map_err(map_io)?;
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).map_err(map_io)?;
+    // Schließt die Gegenseite, ohne die Anfrage zu lesen, kommt ein Reset; bereits
+    // Empfangenes bleibt gültig.
+    if let Err(e) = stream.read_to_end(&mut raw)
+        && (raw.is_empty() || e.kind() != std::io::ErrorKind::ConnectionReset)
+    {
+        return Err(map_io(e));
+    }
     parse_response(&raw)
 }
 
