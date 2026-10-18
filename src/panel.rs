@@ -10,17 +10,28 @@ use crate::client::{ChatBackend, HttpChat, Reply, ToolDef};
 use crate::{KiConfig, KiError, default_config_path, server};
 
 /// Was die App der Seitenleiste zur Verfügung stellt.
+///
+/// Vertrag zwischen App und Seitenleiste:
+///
+/// 1. Solange [`KiPanel::locks_document`] `true` liefert (KI arbeitet oder eine Vorschau wartet auf
+///    „Übernehmen“), macht die App das Dokument schreibgeschützt und ignoriert Änderungen und
+///    Auswahlwechsel. Sonst würde die Antwort auf veralteten Inhalt angewendet.
+/// 2. Nach dem Schließen von „Mosaik einrichten“ (`open_setup`) ruft die App [`KiPanel::refresh`] auf.
+/// 3. `end_undo_group(false)` stellt exakt den Zustand wieder her, den `begin_undo_group` festgehalten hat.
 pub trait KiHost {
     /// Markierter Text bzw. Bereichsinhalt; ohne Markierung das ganze Dokument.
     fn input_text(&self) -> String;
     fn apply(&mut self, apply: Apply, text: &str) -> Result<(), String>;
     fn tools(&mut self) -> &mut dyn KiTools;
     fn begin_undo_group(&mut self);
-    /// `keep == false`: alle Schritte seit `begin_undo_group` zurücknehmen.
+    /// `keep == false`: den Zustand von `begin_undo_group` wiederherstellen (alle Schritte zurücknehmen).
     fn end_undo_group(&mut self, keep: bool);
     /// Öffnet „Mosaik einrichten“ bei der Stufenwahl.
     fn open_setup(&mut self);
 }
+
+/// Antwortlänge im Agentenbetrieb (kurze Werkzeugaufrufe und Abschlusstext).
+const AGENT_MAX_TOKENS: u32 = 1024;
 
 #[derive(Debug)]
 enum Job {
@@ -75,6 +86,16 @@ impl KiPanel {
         matches!(self.state, State::Busy { .. })
     }
 
+    /// `true`, solange die App das Dokument nicht ändern darf: während die KI arbeitet und
+    /// während eine übernehmbare Vorschau offen ist.
+    pub fn locks_document(&self) -> bool {
+        match &self.state {
+            State::Busy { .. } => true,
+            State::Preview { apply, .. } => *apply != Apply::ShowOnly,
+            State::Idle | State::Message(_) => false,
+        }
+    }
+
     fn ready(&mut self) -> bool {
         *self.ready.get_or_insert_with(|| {
             default_config_path()
@@ -86,7 +107,8 @@ impl KiPanel {
     pub fn show(&mut self, ui: &mut egui::Ui, host: &mut dyn KiHost) {
         self.poll(host);
         ui.heading("KI");
-        if !self.ready() {
+        // Eine laufende Arbeit, Vorschau oder Meldung bleibt auch sichtbar, wenn `ready` umspringt.
+        if !self.ready() && matches!(self.state, State::Idle) {
             ui.label(KiError::NotInstalled.user_message());
             if ui.button("KI-Stufe ändern …").clicked() {
                 host.open_setup();
@@ -101,7 +123,8 @@ impl KiPanel {
                 .add_enabled(idle, egui::Button::new(action.label))
                 .clicked()
             {
-                self.start_quick(action, &host.input_text());
+                let input = host.input_text();
+                self.start_quick(action, &input);
             }
         }
         ui.separator();
@@ -179,7 +202,7 @@ impl KiPanel {
     fn start_quick(&mut self, action: &'static QuickAction, input: &str) {
         match actions::build_messages(action, input) {
             Ok(messages) => {
-                let rx = spawn_chat(messages, Vec::new());
+                let rx = spawn_chat(messages, Vec::new(), actions::max_tokens_for(input));
                 self.state = State::Busy {
                     rx,
                     job: Job::Quick(action),
@@ -190,15 +213,29 @@ impl KiPanel {
     }
 
     fn start_agent(&mut self, host: &mut dyn KiHost) {
+        let instruction = self.instruction.trim().to_string();
+        if instruction.is_empty() {
+            return;
+        }
         let user = format!(
-            "{}\n\nAktueller Inhalt:\n<<<\n{}\n>>>",
-            self.instruction.trim(),
+            "{instruction}\n\nAktueller Inhalt:\n<<<\n{}\n>>>",
             host.input_text()
         );
+        let chars = user.chars().count();
+        if chars > actions::MAX_INPUT_CHARS {
+            self.state = State::Message(
+                KiError::TooLong {
+                    chars,
+                    max: actions::MAX_INPUT_CHARS,
+                }
+                .user_message(),
+            );
+            return;
+        }
         let run = AgentRun::new(actions::SYSTEM_PROMPT, &user);
         let defs = host.tools().definitions();
         host.begin_undo_group();
-        let rx = spawn_chat(run.messages().to_vec(), defs);
+        let rx = spawn_chat(run.messages().to_vec(), defs, AGENT_MAX_TOKENS);
         self.state = State::Busy {
             rx,
             job: Job::Agent(run),
@@ -228,13 +265,17 @@ impl KiPanel {
             return;
         };
         self.state = match (job, result) {
-            (Job::Quick(_), Ok(Reply::Text(t))) if t.trim().is_empty() => {
-                State::Message(KiError::BadResponse("leere Antwort".into()).user_message())
+            (Job::Quick(action), Ok(Reply::Text(t))) => {
+                let text = actions::postprocess(action.apply, &t);
+                if text.is_empty() || text == "=" {
+                    State::Message(KiError::BadResponse("leere Antwort".into()).user_message())
+                } else {
+                    State::Preview {
+                        text,
+                        apply: action.apply,
+                    }
+                }
             }
-            (Job::Quick(action), Ok(Reply::Text(t))) => State::Preview {
-                text: actions::postprocess(action.apply, &t),
-                apply: action.apply,
-            },
             (Job::Quick(_), Ok(Reply::ToolCalls { .. })) => {
                 State::Message(KiError::BadResponse("unerwartet".into()).user_message())
             }
@@ -246,7 +287,7 @@ impl KiPanel {
             (Job::Agent(mut run), Ok(reply)) => match run.on_reply(reply, host.tools()) {
                 Step::NeedChat => {
                     let defs = host.tools().definitions();
-                    let rx = spawn_chat(run.messages().to_vec(), defs);
+                    let rx = spawn_chat(run.messages().to_vec(), defs, AGENT_MAX_TOKENS);
                     State::Busy {
                         rx,
                         job: Job::Agent(run),
@@ -276,14 +317,20 @@ impl KiPanel {
 }
 
 /// Startet den Dienst (falls nötig) und stellt eine Chat-Anfrage im Hintergrund.
-fn spawn_chat(messages: Vec<Value>, tools: Vec<ToolDef>) -> Receiver<Result<Reply, KiError>> {
+fn spawn_chat(
+    messages: Vec<Value>,
+    tools: Vec<ToolDef>,
+    max_tokens: u32,
+) -> Receiver<Result<Reply, KiError>> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let result = (|| {
             let path = default_config_path().ok_or(KiError::NotInstalled)?;
             let mut cfg = KiConfig::load(&path).ok_or(KiError::NotInstalled)?;
             let port = server::ensure_running(&mut cfg, Some(&path), Duration::from_secs(180))?;
-            HttpChat::new(port).chat(&messages, &tools)
+            let mut chat = HttpChat::new(port);
+            chat.max_tokens = max_tokens;
+            chat.chat(&messages, &tools)
         })();
         let _ = tx.send(result);
     });
@@ -312,10 +359,16 @@ mod tests {
         applied: Vec<String>,
         groups: Vec<bool>,
         tools: Option<NoTools>,
+        input: String,
+        begins: usize,
     }
     impl KiHost for Host {
         fn input_text(&self) -> String {
-            "Hallo".into()
+            if self.input.is_empty() {
+                "Hallo".into()
+            } else {
+                self.input.clone()
+            }
         }
         fn apply(&mut self, _: Apply, text: &str) -> Result<(), String> {
             self.applied.push(text.into());
@@ -324,7 +377,9 @@ mod tests {
         fn tools(&mut self) -> &mut dyn KiTools {
             self.tools.get_or_insert(NoTools)
         }
-        fn begin_undo_group(&mut self) {}
+        fn begin_undo_group(&mut self) {
+            self.begins += 1;
+        }
         fn end_undo_group(&mut self, keep: bool) {
             self.groups.push(keep);
         }
@@ -388,6 +443,100 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn busy_state(job: Job) -> State {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        State::Busy { rx, job }
+    }
+
+    #[test]
+    fn locks_document_while_busy_or_applicable_preview() {
+        let mut panel = KiPanel::new(&TEXT_ACTIONS);
+        assert!(!panel.locks_document());
+        panel.state = busy_state(Job::Quick(&TEXT_ACTIONS[0]));
+        assert!(panel.locks_document());
+        for (apply, locked) in [
+            (Apply::ReplaceSelection, true),
+            (Apply::InsertFormula, true),
+            (Apply::ShowOnly, false),
+        ] {
+            panel.state = State::Preview {
+                text: "x".into(),
+                apply,
+            };
+            assert_eq!(panel.locks_document(), locked, "{apply:?}");
+        }
+        panel.state = State::Message("m".into());
+        assert!(!panel.locks_document());
+    }
+
+    #[test]
+    fn agent_with_too_long_input_is_rejected_without_undo_group() {
+        let mut panel = KiPanel::new(&TEXT_ACTIONS);
+        panel.ready = Some(true);
+        panel.instruction = "Mach etwas".into();
+        let mut host = Host {
+            input: "ä".repeat(actions::MAX_INPUT_CHARS + 1),
+            ..Host::default()
+        };
+        panel.start_agent(&mut host);
+        match &panel.state {
+            State::Message(m) => {
+                assert_eq!(*m, KiError::TooLong { chars: 0, max: 0 }.user_message())
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(host.begins, 0);
+        assert!(host.groups.is_empty());
+    }
+
+    #[test]
+    fn agent_with_empty_instruction_does_nothing() {
+        let mut panel = KiPanel::new(&TEXT_ACTIONS);
+        panel.instruction = "  ".into();
+        let mut host = Host::default();
+        panel.start_agent(&mut host);
+        assert!(matches!(panel.state, State::Idle));
+        assert_eq!(host.begins, 0);
+    }
+
+    #[test]
+    fn fence_only_or_proseless_formula_answer_becomes_message() {
+        for (action, answer) in [
+            (&TEXT_ACTIONS[0], "```\n```"),
+            (&crate::actions::SHEET_ACTIONS[0], "Das geht leider nicht."),
+            (&crate::actions::SHEET_ACTIONS[0], "="),
+        ] {
+            let mut panel = KiPanel::new(&TEXT_ACTIONS);
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(Ok(crate::client::Reply::Text(answer.into())))
+                .unwrap();
+            panel.state = State::Busy {
+                rx,
+                job: Job::Quick(action),
+            };
+            panel.poll(&mut Host::default());
+            assert!(matches!(panel.state, State::Message(_)), "{answer}");
+        }
+    }
+
+    #[test]
+    fn busy_run_stays_visible_when_ready_flips_false() {
+        let mut panel = KiPanel::new(&TEXT_ACTIONS);
+        panel.ready = Some(false);
+        panel.state = State::Message("Wichtig".into());
+        let ctx = egui::Context::default();
+        let mut host = Host::default();
+        let mut texts = String::new();
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            panel.show(ui, &mut host);
+        });
+        for clipped in &out.shapes {
+            texts.push_str(&format!("{:?}", clipped.shape));
+        }
+        out.drop_without_applying_deltas();
+        assert!(texts.contains("Wichtig"), "{texts}");
     }
 
     #[test]

@@ -2,8 +2,11 @@
 use serde_json::{Value, json};
 
 use crate::KiError;
+use crate::server::CONTEXT_TOKENS;
 
 pub const MAX_INPUT_CHARS: usize = 12_000;
+/// Grobe Schätzung für Systemtext und Anweisung.
+const PROMPT_TOKENS: u32 = 300;
 
 pub const SYSTEM_PROMPT: &str = "Du bist die KI in Mosaik, einer Software für Büro und Gestaltung. \
 Antworte in der Sprache des Textes (meist Deutsch). Gib nur das Ergebnis aus, ohne Einleitung, \
@@ -92,30 +95,60 @@ pub fn postprocess(apply: Apply, answer: &str) -> String {
     }
 }
 
+/// Inhalt des ersten Codeblocks (auch nach einer Einleitung oder einzeilig); ohne Codeblock der Text selbst.
 fn strip_fences(s: &str) -> String {
-    let Some(rest) = s.strip_prefix("```") else {
+    let Some(start) = s.find("```") else {
         return s.to_string();
     };
-    let body = rest.split_once('\n').map_or("", |(_, b)| b);
-    body.trim_end()
-        .strip_suffix("```")
-        .unwrap_or(body)
-        .trim()
-        .to_string()
+    let rest = &s[start + 3..];
+    let (body, closed) = match rest.find("```") {
+        Some(end) => (&rest[..end], true),
+        None => (rest, false),
+    };
+    // Mit Zeilenumbruch ist die erste Zeile die Sprachangabe; einzeilig ist alles Inhalt.
+    let content = match body.split_once('\n') {
+        Some((_lang, text)) => text,
+        None if closed => body,
+        None => "",
+    };
+    content.trim().to_string()
+}
+
+/// Wie `SUM(` oder `STDEV.S(`: Großbuchstabe, dann Großbuchstaben/Ziffern/Punkte, dann `(`.
+fn looks_like_function_call(line: &str) -> bool {
+    let mut chars = line.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    for c in chars {
+        if c == '(' {
+            return true;
+        }
+        if !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.') {
+            return false;
+        }
+    }
+    false
 }
 
 fn formula_line(text: &str) -> String {
-    let line = text
-        .lines()
-        .map(|l| l.trim().trim_matches('`').trim())
-        .find(|l| l.starts_with('='))
-        .or_else(|| text.lines().map(str::trim).find(|l| !l.is_empty()))
-        .unwrap_or("");
-    if line.starts_with('=') {
-        line.to_string()
-    } else {
-        format!("={line}")
+    let lines = || text.lines().map(|l| l.trim().trim_matches('`').trim());
+    if let Some(line) = lines().find(|l| l.starts_with('=')) {
+        return line.to_string();
     }
+    match lines().find(|l| looks_like_function_call(l)) {
+        Some(line) => format!("={line}"),
+        None => String::new(),
+    }
+}
+
+/// Maximale Antwortlänge (Tokens) passend zur Eingabe: der Rest des Kontexts, begrenzt auf 256..=4096.
+pub fn max_tokens_for(input: &str) -> u32 {
+    let est_input = u32::try_from(input.chars().count() / 3).unwrap_or(u32::MAX);
+    CONTEXT_TOKENS
+        .saturating_sub(est_input)
+        .saturating_sub(PROMPT_TOKENS)
+        .clamp(256, 4096)
 }
 
 #[cfg(test)]
@@ -176,6 +209,67 @@ mod tests {
             ),
             "=AVERAGE(B2:B9)"
         );
+    }
+
+    #[test]
+    fn intro_before_fence_is_dropped() {
+        assert_eq!(
+            postprocess(
+                Apply::ReplaceSelection,
+                "Hier ist der Text:\n```text\nA\nB\n```\nViel Erfolg!"
+            ),
+            "A\nB"
+        );
+        assert_eq!(
+            postprocess(
+                Apply::ShowOnly,
+                "Intro:\n```\nErster\n```\nund\n```\nZweiter\n```"
+            ),
+            "Erster"
+        );
+    }
+
+    #[test]
+    fn one_line_fence_gives_content() {
+        assert_eq!(postprocess(Apply::ReplaceSelection, "```Hallo```"), "Hallo");
+        assert_eq!(
+            postprocess(Apply::InsertFormula, "```=SUM(A1)```"),
+            "=SUM(A1)"
+        );
+        assert_eq!(postprocess(Apply::ReplaceSelection, "```\n```"), "");
+    }
+
+    #[test]
+    fn formula_from_prose_and_function_call() {
+        assert_eq!(
+            postprocess(Apply::InsertFormula, "Die Formel lautet:\nSUM(A1)"),
+            "=SUM(A1)"
+        );
+        assert_eq!(
+            postprocess(Apply::InsertFormula, "x\nSTDEV.S(B1:B9)"),
+            "=STDEV.S(B1:B9)"
+        );
+    }
+
+    #[test]
+    fn pure_prose_or_empty_is_no_formula() {
+        assert_eq!(
+            postprocess(Apply::InsertFormula, "Das kann ich leider nicht berechnen."),
+            ""
+        );
+        assert_eq!(postprocess(Apply::InsertFormula, ""), "");
+        assert_eq!(postprocess(Apply::ReplaceSelection, "  "), "");
+    }
+
+    #[test]
+    fn max_tokens_stays_within_bounds_and_uses_context() {
+        assert_eq!(max_tokens_for(""), 4096);
+        assert!(max_tokens_for(&"a".repeat(12_000)) >= 3000);
+        for n in [0, 1, 300, 6000, 12_000, 100_000, 10_000_000] {
+            let t = max_tokens_for(&"a".repeat(n));
+            assert!((256..=4096).contains(&t), "{n}: {t}");
+        }
+        assert_eq!(max_tokens_for(&"a".repeat(60_000)), 256);
     }
 
     #[test]

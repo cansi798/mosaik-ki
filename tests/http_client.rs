@@ -213,3 +213,29 @@ fn dropped_connection_without_reply_is_not_refused() {
         "{e:?}"
     );
 }
+
+#[test]
+fn finish_reason_length_is_answer_too_long() {
+    let body = r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"halber Sat"}}]}"#;
+    assert_eq!(parse_reply(body), Err(KiError::AnswerTooLong));
+    let ok = r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"Fertig."}}]}"#;
+    assert_eq!(parse_reply(ok).unwrap(), Reply::Text("Fertig.".into()));
+}
+
+#[test]
+fn transport_errors_map_to_clean_ki_errors() {
+    // Verbindung abgelehnt
+    let mut chat = HttpChat::new(common::free_port());
+    let e = chat
+        .chat(&[json!({"role":"user","content":"x"})], &[])
+        .unwrap_err();
+    assert_eq!(e, KiError::Unavailable("Verbindung abgelehnt".into()));
+    // Kaputte Antwort
+    let port =
+        raw_server(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123");
+    let mut chat = HttpChat::new(port);
+    let e = chat
+        .chat(&[json!({"role":"user","content":"x"})], &[])
+        .unwrap_err();
+    assert!(matches!(e, KiError::BadResponse(_)), "{e:?}");
+}

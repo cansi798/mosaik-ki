@@ -1,4 +1,6 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -65,15 +67,26 @@ impl KiConfig {
         serde_json::from_str(&text).ok()
     }
 
-    /// Atomar: erst in `<datei>.tmp` schreiben, dann umbenennen.
+    /// Atomar: erst in `<datei>.<pid>.<n>.tmp` schreiben, dann umbenennen. Pid und Zähler verhindern,
+    /// dass gleichzeitige Speichervorgänge (andere Apps, andere Threads) dieselbe Zwischendatei benutzen.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, path)
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut name = path.file_name().map(OsString::from).unwrap_or_default();
+        name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let tmp = path.with_file_name(name);
+        let result = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 }
 
@@ -110,7 +123,42 @@ mod tests {
         let p = dir.path().join("sub").join("mosaik-ki.json");
         cfg.save(&p).unwrap();
         assert_eq!(KiConfig::load(&p), Some(cfg));
-        assert!(!p.with_extension("json.tmp").exists());
+        assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("mosaik-ki.json");
+        let handles: Vec<_> = [Tier::Kompakt, Tier::Pro]
+            .into_iter()
+            .map(|tier| {
+                let p = p.clone();
+                let cfg = KiConfig::new(tier, dir.path().to_path_buf());
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        cfg.save(&p).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(KiConfig::load(&p).is_some());
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "tmp-Dateien übrig");
+    }
+
+    #[test]
+    fn failed_save_leaves_no_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Ziel ist ein Verzeichnis: rename schlägt fehl.
+        let p = dir.path().join("mosaik-ki.json");
+        std::fs::create_dir(&p).unwrap();
+        let cfg = KiConfig::new(Tier::Kompakt, dir.path().to_path_buf());
+        assert!(cfg.save(&p).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

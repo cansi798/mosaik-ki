@@ -66,7 +66,9 @@ impl ChatBackend for HttpChat {
         )
         .map_err(|e| match e {
             HttpError::Timeout => KiError::Timeout,
-            other => KiError::Unavailable(format!("{other:?}")),
+            HttpError::Refused => KiError::Unavailable("Verbindung abgelehnt".into()),
+            HttpError::Malformed(why) => KiError::BadResponse(why),
+            HttpError::Io(why) => KiError::Unavailable(why),
         })?;
         if resp.status != 200 {
             let snippet: String = resp.body.chars().take(200).collect();
@@ -151,6 +153,12 @@ pub fn parse_reply(body: &str) -> Result<Reply, KiError> {
             calls,
             raw: json!({"role": "assistant", "content": null, "tool_calls": list}),
         });
+    }
+    if v.pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        == Some("length")
+    {
+        return Err(KiError::AnswerTooLong);
     }
     Ok(Reply::Text(text.to_string()))
 }

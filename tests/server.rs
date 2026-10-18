@@ -156,3 +156,107 @@ fn peer_that_drops_connections_is_foreign_not_free() {
     });
     assert_eq!(server::probe(port), Probe::Foreign);
 }
+
+fn foreign_listener(port: u16) {
+    let foreign = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    std::thread::spawn(move || {
+        for s in foreign.incoming().flatten() {
+            use std::io::Write;
+            let mut s = s;
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        }
+    });
+}
+
+#[test]
+fn dead_server_is_reported_fast_with_log_tail() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = fake_install(dir.path());
+    let bin = cfg.server_binary();
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\necho 'alt1'; echo 'alt2' >&2; echo 'FEHLER-MARKER: kaputt' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    let e = server::ensure_running(&mut cfg, None, Duration::from_secs(30)).unwrap_err();
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+    match e {
+        KiError::Unavailable(msg) => assert!(msg.contains("FEHLER-MARKER"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn pid_file_is_written_and_stop_terminates_only_our_server() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = fake_install(dir.path());
+    // Nichts zu stoppen: Ok.
+    assert_eq!(server::stop(&cfg), Ok(()));
+    let port = server::ensure_running(&mut cfg, None, Duration::from_secs(10)).unwrap();
+    let pid_file = cfg.install_dir.join("llama-server.pid");
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid > 1);
+    assert_eq!(server::probe(port), Probe::Ours);
+    assert_eq!(server::stop(&cfg), Ok(()));
+    assert_eq!(server::probe(port), Probe::Free);
+    assert!(!pid_file.exists());
+    assert_eq!(server::stop(&cfg), Ok(()));
+}
+
+#[test]
+fn stop_leaves_foreign_program_alone() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = fake_install(dir.path());
+    foreign_listener(cfg.port);
+    // Veraltete PID-Datei (z. B. wiederverwendete PID): niemals beenden, wenn der Port nicht uns gehört.
+    let me = std::process::id();
+    std::fs::write(cfg.install_dir.join("llama-server.pid"), me.to_string()).unwrap();
+    assert_eq!(server::stop(&cfg), Ok(()));
+    // Wir leben noch, und der fremde Port ebenfalls.
+    assert_eq!(server::probe(cfg.port), Probe::Foreign);
+}
+
+#[test]
+fn unwritable_config_path_does_not_prevent_start() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = fake_install(dir.path());
+    foreign_listener(cfg.port);
+    let blocker = dir.path().join("datei");
+    std::fs::write(&blocker, "x").unwrap();
+    let config_path = blocker.join("sub").join("mosaik-ki.json");
+    let old = cfg.port;
+    let port =
+        server::ensure_running(&mut cfg, Some(&config_path), Duration::from_secs(10)).unwrap();
+    assert_ne!(port, old);
+    assert_eq!(server::probe(port), Probe::Ours);
+    quit(port);
+}
+
+#[test]
+fn busy_own_server_that_times_out_counts_as_loading() {
+    let _guard = serial();
+    let port = common::free_port();
+    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    // Nimmt an, antwortet aber nicht (beschäftigter eigener Dienst).
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in listener.incoming().flatten() {
+            held.push(s);
+        }
+    });
+    assert_eq!(server::probe(port), Probe::Loading);
+}
